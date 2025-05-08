@@ -6,16 +6,57 @@ using Agents;
 using Azure;
 using Azure.Search.Documents.Indexes;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using Microsoft.SemanticKernel;
 using Microsoft.SemanticKernel.Agents;
 using Microsoft.SemanticKernel.Agents.OpenAI;
 using Microsoft.SemanticKernel.ChatCompletion;
 using Microsoft.SemanticKernel.Connectors.OpenAI;
 using Microsoft.SemanticKernel.Embeddings;
+using OpenTelemetry.Logs;
+using OpenTelemetry.Resources;
+using OpenTelemetry;
 using Plugins;
+using OpenTelemetry.Trace;
+using Azure.Monitor.OpenTelemetry.Exporter;
+using OpenTelemetry.Metrics;
 
+// Setup telemetry
+var resourceBuilder = ResourceBuilder
+    .CreateDefault()
+    .AddService("AgentRagSearch");
+
+// Enable model diagnostics with sensitive data.
+AppContext.SetSwitch("Microsoft.SemanticKernel.Experimental.GenAI.EnableOTelDiagnosticsSensitive", true);
 Uri endpoint = new(Environment.GetEnvironmentVariable("AZURE_SEARCH_ENDPOINT")!);
 AzureKeyCredential keyCredential = new(Environment.GetEnvironmentVariable("AZURE_SEARCH_APIKEY")!);
+string insightsConnectionString = new(Environment.GetEnvironmentVariable("AZURE_INSIGHTS_CSTRING")!);
+
+using var traceProvider = Sdk.CreateTracerProviderBuilder()
+    .SetResourceBuilder(resourceBuilder)
+    .AddSource("Microsoft.SemanticKernel*")
+    .AddAzureMonitorTraceExporter(options => options.ConnectionString = insightsConnectionString)
+    .Build();
+
+using var meterProvider = Sdk.CreateMeterProviderBuilder()
+    .SetResourceBuilder(resourceBuilder)
+    .AddMeter("Microsoft.SemanticKernel*")
+    .AddAzureMonitorMetricExporter(options => options.ConnectionString = insightsConnectionString)
+    .Build();
+
+using var loggerFactory = LoggerFactory.Create(builder =>
+{
+    // Add OpenTelemetry as a logging provider
+    builder.AddOpenTelemetry(options =>
+    {
+        options.SetResourceBuilder(resourceBuilder);
+        options.AddAzureMonitorLogExporter(options => options.ConnectionString = insightsConnectionString);
+        // Format log messages. This is default to false.
+        options.IncludeFormattedMessage = true;
+        options.IncludeScopes = true;
+    });
+    builder.SetMinimumLevel(LogLevel.Trace);
+});
 
 // Create kernel builder
 IKernelBuilder kernelBuilder = Kernel.CreateBuilder();
@@ -27,10 +68,10 @@ kernelBuilder.Services.AddSingleton<ITextEmbeddingGenerationService, OpenAITextE
 kernelBuilder.Services.AddSingleton<SearchIndexClient>((_) => new SearchIndexClient(endpoint, keyCredential));
 
 // Embedding generation service to convert string query to vector
-kernelBuilder.AddAzureOpenAITextEmbeddingGeneration("ada", Environment.GetEnvironmentVariable("AZURE_OAI_ENDPOINT")!, Environment.GetEnvironmentVariable("AZURE_OAI_APIKEY")!);
+kernelBuilder.AddAzureOpenAITextEmbeddingGeneration("text-embedding-3-small", Environment.GetEnvironmentVariable("AZURE_OAI_ENDPOINT")!, Environment.GetEnvironmentVariable("AZURE_OAI_APIKEY")!);
 
 // Chat completion service to ask questions based on data from Azure AI Search index.
-kernelBuilder.AddAzureOpenAIChatCompletion("gpt4o", Environment.GetEnvironmentVariable("AZURE_OAI_ENDPOINT")!, Environment.GetEnvironmentVariable("AZURE_OAI_APIKEY")!);
+kernelBuilder.AddAzureOpenAIChatCompletion("gpt-4o", Environment.GetEnvironmentVariable("AZURE_OAI_ENDPOINT")!, Environment.GetEnvironmentVariable("AZURE_OAI_APIKEY")!);
 
 // Register Azure AI Search Plugin
 kernelBuilder.Plugins.AddFromType<AzureAISearchPlugin>();
@@ -38,9 +79,10 @@ kernelBuilder.Plugins.AddFromType<AzureAISearchPlugin>();
 // Create kernel
 var kernel = kernelBuilder.Build();
 
+kernelBuilder.Services.AddSingleton(loggerFactory);
 Console.WriteLine("Creating AzureAI agent...");
 
-OpenAIAssistantDefinition definition = new(modelId: "gpt4o");
+OpenAIAssistantDefinition definition = new(modelId: "gpt-4o");
 
 OpenAIAssistantAgent agent =
 await OpenAIAssistantAgent.CreateAsync(
